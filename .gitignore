@@ -1,0 +1,11 @@
+# 本地环境配置及密钥
+.env
+
+# Python 环境与缓存
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 知识图谱导入数据
+data/*

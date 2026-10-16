@@ -2,6 +2,9 @@ import os
 import json
 import re
 import sys
+from time import perf_counter
+from uuid import uuid4
+from contextlib import contextmanager
 from pathlib import Path
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template
@@ -191,8 +194,22 @@ def index():
     return render_template("index.html")
 
 
+@contextmanager
+def measure_stage(timings, stage):
+    started = perf_counter()
+    try:
+        yield
+    finally:
+        timings[stage] = round((perf_counter() - started) * 1000, 2)
+
+
 @app.route("/ask", methods=["POST"])
 def ask_post():
+    started = perf_counter()
+    request_id = uuid4().hex[:12]
+    timings = {"generate_cypher_ms": None, "query_ms": None, "answer_ms": None}
+    status = "error"
+    fetched_rows = returned_rows = 0
     try:
         data = request.get_json()
         if not data or "question" not in data:
@@ -201,12 +218,18 @@ def ask_post():
         question = data["question"]
         limit = data.get("limit", 20)
 
-        cypher = generate_cypher(question)
-        results = execute_query(cypher)
+        with measure_stage(timings, "generate_cypher_ms"):
+            cypher = generate_cypher(question)
+        with measure_stage(timings, "query_ms"):
+            results = execute_query(cypher)
+        fetched_rows = len(results)
         if results:
             results = results[:limit]
 
-        answer = format_answer(question, results)
+        returned_rows = len(results)
+        with measure_stage(timings, "answer_ms"):
+            answer = format_answer(question, results)
+        status = "ok"
 
         return jsonify({
             "success": True,
@@ -218,6 +241,18 @@ def ask_post():
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        # 仅记录耗时和行数，不记录问题、答案、查询数据或凭据。
+        print("[问答计时] " + json.dumps({
+            "请求编号": request_id,
+            "状态": "成功" if status == "ok" else "失败",
+            "生成查询耗时（毫秒）": timings["generate_cypher_ms"],
+            "数据库查询耗时（毫秒）": timings["query_ms"],
+            "生成回答耗时（毫秒）": timings["answer_ms"],
+            "总耗时（毫秒）": round((perf_counter() - started) * 1000, 2),
+            "数据库取回行数": fetched_rows,
+            "最终返回行数": returned_rows,
+        }, ensure_ascii=False), flush=True)
 
 
 @app.route("/health")

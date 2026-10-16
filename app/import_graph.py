@@ -3,12 +3,11 @@
 安装依赖：pip install -r requirements.txt
 在项目根目录运行：python -B app/import_graph.py
 在项目根目录 .env 配置 EXCEL_PATH 和 NEO4J_* 后运行。CLEAR_DATABASE=True会清空指定数据库的全部节点和关系。
-Excel需包含“单项工程”列，每条有效记录均需填写；已有记录编号继续复用。
-新增顶层会改变下级层级节点ID，从旧模型迁移时使用全量重建。
 """
 
 from pathlib import Path
 import os
+import argparse
 from dotenv import load_dotenv
 from uuid import NAMESPACE_URL, uuid4, uuid5
 import json
@@ -123,6 +122,14 @@ def write_record(tx, record):
         ).consume()
 
 
+def ensure_name_indexes(session):
+    """为实际按名称搜索的六类节点建立非唯一文本索引，可重复运行。"""
+    for label in LABELS:
+        session.run(
+            f"CREATE TEXT INDEX IF NOT EXISTS FOR (n:`{label}`) ON (n.name)"
+        ).consume()
+
+
 def import_graph(excel_path, uri, user, password, database="neo4j", clear_database=False):
     with GraphDatabase.driver(uri, auth=(user, password)) as driver:
         driver.verify_connectivity()
@@ -148,6 +155,7 @@ def import_graph(excel_path, uri, user, password, database="neo4j", clear_databa
                 session.run(
                     f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:`{label}`) REQUIRE n.id IS UNIQUE"
                 ).consume()
+            ensure_name_indexes(session)
             for count, record in enumerate(records, 1):
                 session.execute_write(write_record, record)
                 if count % 100 == 0:
@@ -156,8 +164,17 @@ def import_graph(excel_path, uri, user, password, database="neo4j", clear_databa
 
 
 if __name__ == "__main__":
+    # 拒绝未知参数，避免旧命令被忽略后意外进入全量导入。
+    parser = argparse.ArgumentParser(description="从 Excel 导入知识图谱")
+    parser.parse_args()
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
     load_dotenv(PROJECT_ROOT / ".env")
+    NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+    NEO4J_USER = os.getenv("NEO4J_USERNAME", "neo4j")
+    NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
+    NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
+    if not NEO4J_PASSWORD:
+        raise ValueError("请在项目根目录 .env 中配置 NEO4J_PASSWORD")
     excel_setting = os.getenv("EXCEL_PATH", "").strip()
     if not excel_setting:
         raise ValueError("请在项目根目录 .env 中配置 EXCEL_PATH")
@@ -168,12 +185,6 @@ if __name__ == "__main__":
     if not EXCEL_PATH.is_file():
         raise FileNotFoundError(f"Excel 文件不存在：{EXCEL_PATH}")
 
-    NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    NEO4J_USER = os.getenv("NEO4J_USERNAME", "neo4j")
-    NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
-    NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
-    if not NEO4J_PASSWORD:
-        raise ValueError("请在项目根目录 .env 中配置 NEO4J_PASSWORD")
     CLEAR_DATABASE = True  # 全量重建时改为True；会清空此数据库全部节点和关系。
 
     import_graph(

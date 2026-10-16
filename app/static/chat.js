@@ -10,7 +10,7 @@ async function sendMessage() {
     sendBtn.disabled = true;
     addMessage('user', question);
     input.value = '';
-    const bubble = addMessage('bot', '正在生成查询…');
+    const bubble = addMessage('bot', '正在分析问题…');
     const answer = bubble.firstElementChild;
     answer.classList.add("is-loading");
     answer.setAttribute("aria-busy", "true");

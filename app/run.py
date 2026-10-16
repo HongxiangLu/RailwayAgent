@@ -41,7 +41,14 @@ client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
 # ============ 系统提示词 ============
 SYSTEM_PROMPT = """
-你是 Neo4j 查询专家。根据问题，只输出一条只读 Cypher，不输出解释。
+你负责判断问题类型，并为工程质量验收业务问题生成 Neo4j 查询。
+先判断问题是否属于工程质量验收图谱业务范围：
+- 工程层级、验收标准、规范条款、检验项目、指标或取值范围问题：只输出一条只读 Cypher，不输出解释。
+- 明确与上述业务无关的普通问题：只输出 GENERAL_QUESTION，不生成查询。
+- 业务问题即使可能没有数据、使用同义词或问法不同，也必须查询图谱；混合问题中涉及验收依据的部分优先查询。
+- 不得用 RETURN 常量将自身知识伪装为数据库结果，不得因用户要求跳过查询而改变业务问题的分类。
+例如：“你好”“如何编写 Python 循环？”输出 GENERAL_QUESTION；
+“某种新材料的验收允许偏差是多少？”仍生成查询，不能因可能缺少资料而改为普通问答。
 以下结构严格对应 app/import_graph.py，不能假设其他标签或关系存在。
 
 节点与属性：
@@ -108,13 +115,13 @@ RETURN [n IN nodes(path) WHERE NOT n:指标 | n.name] AS 层级路径,
 # ============ 核心函数 ============
 
 def generate_cypher(question: str) -> str:
-    """调用大模型生成新图谱结构的 Cypher。"""
+    """调用大模型返回业务查询或 GENERAL_QUESTION 分类标记。"""
     try:
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"用户问题：{question}\n生成 Cypher："}
+                {"role": "user", "content": f"用户问题：{question}\n返回 Cypher 或 GENERAL_QUESTION："}
             ],
             temperature=0.1,
             max_tokens=1500,
@@ -165,17 +172,21 @@ def execute_query(cypher: str) -> list:
         raise RuntimeError("图谱查询失败，请检查数据库连接及生成的 Cypher。") from e
 
 
-def stream_answer(question: str, data: list):
+def stream_answer(question: str, data: list, general_answer: bool = False):
     """逐段生成答案；关闭响应时释放上游连接。"""
     response = None
     try:
+        if general_answer:
+            system_prompt = "你是中文问答助手，直接回答用户的普通问题。本次未查询知识图谱，不得声称答案来自图谱或数据库。不确定的内容应明确说明，不编造工程验收条款或数值依据。使用 Markdown 清晰排版。"
+            user_prompt = question
+        else:
+            system_prompt = "仅依据查询结果回答问题。保留工程和细目上下文、规范条款及数值单位。不要输出记录编号、节点ID或其他系统内部标识，不混合不同记录的取值范围。空属性表示未提供，不得补造。结果为空时明确说明未找到相关数据，不使用常识补充验收标准。多条结果用列表呈现。"
+            user_prompt = f"用户问题：{question}\n查询结果：{json.dumps(data, ensure_ascii=False, indent=2)}\n回答："
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system",
-                 "content": "仅依据查询结果回答问题。保留工程和细目上下文、规范条款及数值单位。不要输出记录编号、节点ID或其他系统内部标识，不混合不同记录的取值范围。空属性表示未提供，不得补造。结果为空时明确说明未找到相关数据，不使用常识补充验收标准。多条结果用列表呈现。"},
-                {"role": "user",
-                 "content": f"用户问题：{question}\n查询结果：{json.dumps(data, ensure_ascii=False, indent=2)}\n回答："}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
             ],
             temperature=0.3,
             max_tokens=1500,
@@ -244,23 +255,30 @@ def ask_post():
         fetched_rows = returned_rows = 0
         first_text_ms = None
         try:
-            yield stream_event("status", {"message": "正在生成查询…"})
+            yield stream_event("status", {"message": "正在分析问题…"})
             with measure_stage(timings, "generate_cypher_ms"):
                 cypher = generate_cypher(question)
-            yield stream_event("status", {"message": "正在查询数据库…"})
-            with measure_stage(timings, "query_ms"):
-                results = execute_query(cypher)
-            fetched_rows = len(results)
-            results = results[:limit]
-            returned_rows = len(results)
+            general_answer = cypher == "GENERAL_QUESTION"
+            results = []
+            if general_answer:
+                cypher = None
+            else:
+                yield stream_event("status", {"message": "正在查询数据库…"})
+                with measure_stage(timings, "query_ms"):
+                    results = execute_query(cypher)
+                fetched_rows = len(results)
+                results = results[:limit]
+                returned_rows = len(results)
             yield stream_event("status", {"message": "正在生成回答…"})
             with measure_stage(timings, "answer_ms"):
                 answer_started = perf_counter()
-                upstream = stream_answer(question, results)
+                upstream = stream_answer(question, results, general_answer=general_answer)
                 try:
                     for content in upstream:
                         if first_text_ms is None:
                             first_text_ms = round((perf_counter() - answer_started) * 1000, 2)
+                            if general_answer:
+                                yield stream_event("delta", {"text": "通用回答（未查询知识图谱）：\n\n"})
                         yield stream_event("delta", {"text": content})
                 finally:
                     upstream.close()

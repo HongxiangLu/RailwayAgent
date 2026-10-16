@@ -12,6 +12,8 @@ async function sendMessage() {
     input.value = '';
     const bubble = addMessage('bot', '正在生成查询…');
     const answer = bubble.firstElementChild;
+    answer.classList.add("is-loading");
+    answer.setAttribute("aria-busy", "true");
     let content = '', completed = false, timer = null, reader;
     const redraw = () => { timer = null; renderAnswer(answer, content); };
     const handleEvent = (frame) => {
@@ -80,6 +82,8 @@ async function sendMessage() {
         notice.textContent = `❌ ${content ? '回答未完成：' : ''}${error.message}`;
         bubble.appendChild(notice);
     } finally {
+        answer.classList.remove("is-loading");
+        answer.removeAttribute("aria-busy");
         clearTimeout(timer);
         if (reader) {
             try { await reader.cancel(); } catch (_) { /* 连接可能已经关闭 */ }
@@ -92,6 +96,8 @@ async function sendMessage() {
 }
 
 function renderAnswer(element, content) {
+    element.classList.remove("is-loading");
+    element.removeAttribute("aria-busy");
     if (window.marked && window.DOMPurify) {
         element.className = 'markdown-body';
         element.innerHTML = DOMPurify.sanitize(marked.parse(content, { gfm: true, breaks: false }));

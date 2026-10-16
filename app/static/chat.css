@@ -342,3 +342,23 @@ body {
         font-size: 13px;
     }
 }
+
+/* 阶段提示旁的加载圆圈，正文开始显示后移除。 */
+.markdown-body.is-loading { overflow: visible; }
+.is-loading::before {
+    content: "";
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    margin-right: 8px;
+    border: 2px solid #dbe7fa;
+    border-top-color: #1a73e8;
+    border-radius: 50%;
+    vertical-align: -2px;
+    animation: loading-spin 0.8s linear infinite;
+}
+.is-loading > p:first-child { display: inline; }
+@keyframes loading-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+    .is-loading::before { animation: none; }
+}

@@ -117,7 +117,8 @@ def generate_cypher(question: str) -> str:
                 {"role": "user", "content": f"用户问题：{question}\n生成 Cypher："}
             ],
             temperature=0.1,
-            max_tokens=1500
+            max_tokens=1500,
+            extra_body={"enable_thinking": False},
         )
         cypher = (response.choices[0].message.content or "").strip()
         cypher = re.sub(r'^```cypher\s*', '', cypher)
@@ -178,7 +179,8 @@ def stream_answer(question: str, data: list):
             ],
             temperature=0.3,
             max_tokens=1500,
-            stream=True
+            stream=True,
+            extra_body={"enable_thinking": False},
         )
         has_text = False
         finished = False

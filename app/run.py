@@ -5,7 +5,6 @@ import sys
 from pathlib import Path
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template
-from flask_cors import CORS
 from neo4j import GraphDatabase
 from openai import OpenAI
 
@@ -19,7 +18,6 @@ load_dotenv(PROJECT_ROOT / '.env')
 
 # ============ 初始化 Flask ============
 app = Flask(__name__, template_folder="web")
-CORS(app)
 
 # ============ Neo4j 配置 ============
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
@@ -109,7 +107,6 @@ RETURN [n IN nodes(path) WHERE NOT n:指标 | n.name] AS 层级路径,
 def generate_cypher(question: str) -> str:
     """调用大模型生成新图谱结构的 Cypher。"""
     try:
-        question = question.encode('utf-8').decode('utf-8')
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
@@ -159,26 +156,13 @@ def execute_query(cypher: str) -> list:
     try:
         with driver.session(database=NEO4J_DATABASE) as session:
             result = session.run(cypher)
-            records = result.data()
-            processed = []
-            for record in records:
-                item = {}
-                for key, value in record.items():
-                    if hasattr(value, 'items'):
-                        item[key] = dict(value)
-                    elif isinstance(value, list):
-                        item[key] = [dict(v) if hasattr(v, 'items') else v for v in value]
-                    else:
-                        item[key] = value
-                processed.append(item)
-            return public_query_data(processed)
+            return public_query_data(result.data())
     except Exception as e:
         raise RuntimeError("图谱查询失败，请检查数据库连接及生成的 Cypher。") from e
 
 
 def format_answer(question: str, data: list) -> str:
-    """格式化答案"""
-    data = public_query_data(data)
+    """根据 execute_query 已过滤的公开数据生成答案。"""
     try:
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -207,18 +191,6 @@ def index():
     return render_template("index.html")
 
 
-@app.route("/api")
-def api_index():
-    return jsonify({
-        "service": "高铁桥梁质量验收智能问答系统",
-        "endpoints": {
-            "POST /ask": "发送问题，返回答案",
-            "GET /ask?question=你的问题": "GET 方式提问",
-            "GET /health": "健康检查"
-        }
-    })
-
-
 @app.route("/ask", methods=["POST"])
 def ask_post():
     try:
@@ -230,40 +202,6 @@ def ask_post():
         limit = data.get("limit", 20)
 
         cypher = generate_cypher(question)
-        if not cypher:
-            return jsonify({"error": "生成查询语句失败"}), 500
-
-        results = execute_query(cypher)
-        if results:
-            results = results[:limit]
-
-        answer = format_answer(question, results)
-
-        return jsonify({
-            "success": True,
-            "question": question,
-            "answer": answer,
-            "cypher": cypher,
-            "data": results
-        })
-
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route("/ask", methods=["GET"])
-def ask_get():
-    question = request.args.get("question")
-    if not question:
-        return jsonify({"error": "请提供 question 参数"}), 400
-
-    limit = request.args.get("limit", 20, type=int)
-
-    try:
-        cypher = generate_cypher(question)
-        if not cypher:
-            return jsonify({"error": "生成查询语句失败"}), 500
-
         results = execute_query(cypher)
         if results:
             results = results[:limit]
@@ -297,7 +235,5 @@ if __name__ == "__main__":
     print("=" * 50)
     print("🚀 高铁桥梁质量验收智能问答系统启动")
     print("📍 聊天界面: http://localhost:5000")
-    print("📮 POST /ask  (JSON: {'question': '你的问题'})")
-    print("📮 GET  /ask?question=你的问题")
     print("=" * 50)
     app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)

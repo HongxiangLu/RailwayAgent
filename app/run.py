@@ -7,7 +7,7 @@ from uuid import uuid4
 from contextlib import contextmanager
 from pathlib import Path
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, Response
 from neo4j import GraphDatabase
 from openai import OpenAI
 
@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / '.env')
 
 # ============ 初始化 Flask ============
-app = Flask(__name__, template_folder="web")
+app = Flask(__name__)
 
 # ============ Neo4j 配置 ============
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
@@ -164,8 +164,9 @@ def execute_query(cypher: str) -> list:
         raise RuntimeError("图谱查询失败，请检查数据库连接及生成的 Cypher。") from e
 
 
-def format_answer(question: str, data: list) -> str:
-    """根据 execute_query 已过滤的公开数据生成答案。"""
+def stream_answer(question: str, data: list):
+    """逐段生成答案；关闭响应时释放上游连接。"""
+    response = None
     try:
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -176,14 +177,30 @@ def format_answer(question: str, data: list) -> str:
                  "content": f"用户问题：{question}\n查询结果：{json.dumps(data, ensure_ascii=False, indent=2)}\n回答："}
             ],
             temperature=0.3,
-            max_tokens=1500
+            max_tokens=1500,
+            stream=True
         )
-        answer = (response.choices[0].message.content or "").strip()
-        if not answer:
-            raise ValueError("模型未返回回答")
-        return answer
+        has_text = False
+        finished = False
+        for chunk in response:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            content = choice.delta.content or ""
+            if content:
+                has_text = has_text or bool(content.strip())
+                yield content
+            if choice.finish_reason is not None:
+                if choice.finish_reason != "stop":
+                    raise ValueError("模型输出未完整结束")
+                finished = True
+        if not has_text or not finished:
+            raise ValueError("模型未返回完整回答")
     except Exception as e:
         raise RuntimeError("大模型生成回答失败，请检查模型服务及返回内容。") from e
+    finally:
+        if response is not None:
+            response.close()
 
 
 # ============ API 接口 ============
@@ -191,7 +208,7 @@ def format_answer(question: str, data: list) -> str:
 @app.route("/")
 def index():
     """聊天界面"""
-    return render_template("index.html")
+    return app.send_static_file("index.html")
 
 
 @contextmanager
@@ -203,56 +220,70 @@ def measure_stage(timings, stage):
         timings[stage] = round((perf_counter() - started) * 1000, 2)
 
 
+def stream_event(event, payload):
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 @app.route("/ask", methods=["POST"])
 def ask_post():
     started = perf_counter()
-    request_id = uuid4().hex[:12]
-    timings = {"generate_cypher_ms": None, "query_ms": None, "answer_ms": None}
-    status = "error"
-    fetched_rows = returned_rows = 0
-    try:
-        data = request.get_json()
-        if not data or "question" not in data:
-            return jsonify({"error": "请提供 question 参数"}), 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("question"), str) or not data["question"].strip():
+        return jsonify({"success": False, "error": "请提供非空 question 参数"}), 400
+    question = data["question"]
+    limit = data.get("limit", 20)
+    if type(limit) is not int or limit <= 0:
+        return jsonify({"success": False, "error": "limit 必须为正整数"}), 400
 
-        question = data["question"]
-        limit = data.get("limit", 20)
-
-        with measure_stage(timings, "generate_cypher_ms"):
-            cypher = generate_cypher(question)
-        with measure_stage(timings, "query_ms"):
-            results = execute_query(cypher)
-        fetched_rows = len(results)
-        if results:
+    def events():
+        request_id = uuid4().hex[:12]
+        timings = {"generate_cypher_ms": None, "query_ms": None, "answer_ms": None}
+        status = "失败"
+        fetched_rows = returned_rows = 0
+        first_text_ms = None
+        try:
+            yield stream_event("status", {"message": "正在生成查询…"})
+            with measure_stage(timings, "generate_cypher_ms"):
+                cypher = generate_cypher(question)
+            yield stream_event("status", {"message": "正在查询数据库…"})
+            with measure_stage(timings, "query_ms"):
+                results = execute_query(cypher)
+            fetched_rows = len(results)
             results = results[:limit]
+            returned_rows = len(results)
+            yield stream_event("status", {"message": "正在生成回答…"})
+            with measure_stage(timings, "answer_ms"):
+                answer_started = perf_counter()
+                upstream = stream_answer(question, results)
+                try:
+                    for content in upstream:
+                        if first_text_ms is None:
+                            first_text_ms = round((perf_counter() - answer_started) * 1000, 2)
+                        yield stream_event("delta", {"text": content})
+                finally:
+                    upstream.close()
+            status = "成功"
+            yield stream_event("done", {"cypher": cypher, "data": results})
+        except GeneratorExit:
+            if status != "成功":
+                status = "连接中断"
+            raise
+        except Exception as e:
+            yield stream_event("error", {"message": str(e)})
+        finally:
+            print("[问答计时] " + json.dumps({
+                "请求编号": request_id, "状态": status,
+                "生成查询耗时（毫秒）": timings["generate_cypher_ms"],
+                "数据库查询耗时（毫秒）": timings["query_ms"],
+                "生成回答耗时（毫秒）": timings["answer_ms"],
+                "回答首段等待（毫秒）": first_text_ms,
+                "总耗时（毫秒）": round((perf_counter() - started) * 1000, 2),
+                "数据库取回行数": fetched_rows, "最终返回行数": returned_rows,
+            }, ensure_ascii=False), flush=True)
 
-        returned_rows = len(results)
-        with measure_stage(timings, "answer_ms"):
-            answer = format_answer(question, results)
-        status = "ok"
-
-        return jsonify({
-            "success": True,
-            "question": question,
-            "answer": answer,
-            "cypher": cypher,
-            "data": results
-        })
-
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-    finally:
-        # 仅记录耗时和行数，不记录问题、答案、查询数据或凭据。
-        print("[问答计时] " + json.dumps({
-            "请求编号": request_id,
-            "状态": "成功" if status == "ok" else "失败",
-            "生成查询耗时（毫秒）": timings["generate_cypher_ms"],
-            "数据库查询耗时（毫秒）": timings["query_ms"],
-            "生成回答耗时（毫秒）": timings["answer_ms"],
-            "总耗时（毫秒）": round((perf_counter() - started) * 1000, 2),
-            "数据库取回行数": fetched_rows,
-            "最终返回行数": returned_rows,
-        }, ensure_ascii=False), flush=True)
+    return Response(events(), mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+    })
 
 
 @app.route("/health")

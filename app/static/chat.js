@@ -1,6 +1,16 @@
 const messagesContainer = document.getElementById('messages');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('sendBtn');
+const conversationId = getConversationId();
+
+function getConversationId() {
+    let id = sessionStorage.getItem('conversation_id');
+    if (!id) {
+        id = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        sessionStorage.setItem('conversation_id', id);
+    }
+    return id;
+}
 
 // ============ 发送消息 ============
 async function sendMessage() {
@@ -47,7 +57,7 @@ async function sendMessage() {
     try {
         const response = await fetch('/ask', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ question, limit: 30 })
+            body: JSON.stringify({ conversation_id: conversationId, question, limit: 30 })
         });
         if (!response.ok) {
             const data = await response.json();
@@ -91,6 +101,27 @@ async function sendMessage() {
         }
         input.disabled = false;
         sendBtn.disabled = false;
+        input.focus();
+    }
+}
+
+// ============ 清空多轮会话 ============
+async function clearConversation() {
+    if (input.disabled) return;
+    const button = document.getElementById('clearBtn');
+    button.disabled = true;
+    try {
+        const response = await fetch(`/conversation/${encodeURIComponent(conversationId)}`, {
+            method: 'DELETE'
+        });
+        const data = await response.json();
+        if (!response.ok || !data.success) throw new Error(data.error || '清空失败');
+        messagesContainer.replaceChildren();
+        addMessage('bot', '已开始新对话。之前的问答内容不会再参与回答。');
+    } catch (error) {
+        addMessage('bot', `❌ ${error.message}`);
+    } finally {
+        button.disabled = false;
         input.focus();
     }
 }

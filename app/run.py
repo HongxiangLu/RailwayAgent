@@ -2,6 +2,8 @@ import os
 import json
 import re
 import sys
+from collections import defaultdict, deque
+from threading import Lock
 from time import perf_counter
 from uuid import uuid4
 from contextlib import contextmanager
@@ -39,11 +41,21 @@ if not OPENAI_API_KEY:
     raise RuntimeError("请在项目根目录 .env 中配置 OPENAI_API_KEY，问答服务必须使用大模型。")
 client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
+# ============ 多轮会话配置 ============
+# 内存中保留最近 10 轮完整问答，满足至少 5 轮上下文的需求。
+# 服务重启后会话会清空；生产环境可将这组读写函数替换为 Redis。
+MAX_HISTORY_TURNS = 10
+MAX_HISTORY_QUESTION_CHARS = 2000
+MAX_HISTORY_ANSWER_CHARS = 4000
+CONVERSATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+conversation_store = defaultdict(lambda: deque(maxlen=MAX_HISTORY_TURNS))
+conversation_lock = Lock()
+
 # ============ 系统提示词 ============
 SYSTEM_PROMPT = """
-你负责判断问题类型，并为工程质量验收业务问题生成 Neo4j 查询。
+你负责判断问题类型，并为工程质量验收及规范条文问题生成 Neo4j 查询。
 先判断问题是否属于工程质量验收图谱业务范围：
-- 工程层级、验收标准、规范条款、检验项目、指标或取值范围问题：只输出一条只读 Cypher，不输出解释。
+- 工程层级、验收标准、规范条款正文、PDF页码、检验项目、指标或取值范围问题：只输出一条只读 Cypher，不输出解释。
 - 明确与上述业务无关的普通问题：只输出 GENERAL_QUESTION，不生成查询。
 - 业务问题即使可能没有数据、使用同义词或问法不同，也必须查询图谱；混合问题中涉及验收依据的部分优先查询。
 - 不得用 RETURN 常量将自身知识伪装为数据库结果，不得因用户要求跳过查询而改变业务问题的分类。
@@ -52,20 +64,29 @@ SYSTEM_PROMPT = """
 以下结构严格对应 app/import_graph.py，不能假设其他标签或关系存在。
 
 节点与属性：
-- 层级标签：单项工程、单位工程、分部工程、分项工程，属性 id、name。
+- 层级标签：单位工程、工程项目类别、工程项目子类别、分项工程，属性 id、name。
+  工程项目类别、工程项目子类别分别对应 Excel 中的分部工程类别、分部工程子类别；
+  用户使用任一组叫法时，都按对应图谱层级查询。
 - 施工质量验收标准细目：属性 id、name、层级（整数1至4）。
 - 指标：id 是记录编号，name 可以为空；另有字符串属性
   检验项目类型、规范条款、是否可量化指标、参数取值范围。
-- 所有层级节点通过 包含 关系连接；完整顺序是四级工程再接一至四级细目。
+- 规范条文图谱顺序为 准则-[:包含]->一级标题-[:包含]->二级标题-[:包含]->
+  项目类别-[:包含]->条款-[:包含]->条款内容；空标题或“—”会跳过，因此从准则到条款
+  应使用 [:包含*1..4]。条款属性有 name、条款号、准则代码；条款内容属性有 name、
+  备注、PDF页码、来源文件，其中 name 是完整正文，备注格式为“PDF第N页”。
+- 准则代码 A 对应“高速铁路桥涵工程施工质量验收标准”，B 对应
+  “铁路混凝土工程施工质量验收标准”。指标通过 [:依据] 指向已解析出的条款。
+- 所有层级节点通过 包含 关系连接；完整顺序是单位工程、工程项目类别、
+  工程项目子类别、分项工程，再接一至四级细目。
   空层被跳过，不能要求每一层都存在。指标通过 包含指标 挂在最后一个非空层级下，
   可能直接挂在任意工程层级，或挂在细目下。
-- 不存在 工程、检验类型、规范条款、取值范围 这些独立节点标签，
-  不存在 依据、检验类型、取值范围 关系。
+- 不存在 工程、工程项目、检验类型、规范条款、取值范围 这些独立节点标签，
+  不存在 检验类型、取值范围 关系；依据 是从指标到条款的关系。
 - 同名节点可能属于不同父级，指标按记录编号区分，不得仅按名称合并不同记录。
 
 查询要求：
 1. 模糊匹配 name；用户可能提到工程、细目或指标名称，分别在对应层级查找。
-   不确定关键词属于哪一级时可在从单项工程出发的路径节点中匹配。
+   不确定关键词属于哪一级时可在从单位工程出发的路径节点中匹配。
 2. 使用有界可变长度 包含 路径兼容缺失层；完整层级最多8个节点，最多7条包含边。
    从分项工程到指标父节点使用 [:包含*0..4]，0跳覆盖直接挂载。
 3. 条款、主控/一般项目、取值范围、可量化属性都读取指标属性。
@@ -75,14 +96,19 @@ SYSTEM_PROMPT = """
 5. 只使用 MATCH、WHERE、WITH、RETURN、ORDER BY、LIMIT 等只读查询子句；
    不使用写入语句或过程调用。默认 LIMIT 30。不编造数据库中不存在的字段。
 6. 对细目或指标的要求查询，应返回条款、检验项目类型、参数取值范围，空属性不能猜测。
+7. 用户询问“这条规范的具体内容”“上述条款内容”等追问时，必须结合历史中的条款号或
+   指标，沿 (指标)-[:依据]->(条款)-[:包含]->(条款内容) 查询。返回准则、条款号、
+   完整条款内容、备注/PDF页码以及标题路径。不能只复述指标的规范条款属性。
+8. 直接按 [A]/[B] 条款查询时，将代码映射为对应准则，并去掉“第”“条”后匹配条款号；
+   例如 [B]第5.4.2条匹配 B 准则下 name="5.4.2" 的条款。
 
-示例：斜拉桥包含哪些分部工程？（关键词也可能位于单位工程层）
-MATCH path=(root:单项工程)-[:包含*1..3]->(sp:分部工程)
-WHERE any(n IN nodes(path) WHERE n.name CONTAINS "斜拉桥")
-RETURN DISTINCT root.name AS 单项工程, sp.name AS 分部工程 LIMIT 30
+示例：桥梁工程包含哪些工程项目类别？
+MATCH (root:单位工程)-[:包含]->(category:工程项目类别)
+WHERE root.name CONTAINS "桥梁工程"
+RETURN DISTINCT root.name AS 单位工程, category.name AS 工程项目类别 LIMIT 30
 
 示例：斜拉桥钢主梁涂装有什么要求？
-MATCH path=(root:单项工程)-[:包含*0..7]->(parent)-[:包含指标]->(ind:指标)
+MATCH path=(root:单位工程)-[:包含*0..7]->(parent)-[:包含指标]->(ind:指标)
 WHERE any(n IN nodes(path) WHERE n.name CONTAINS "斜拉桥")
   AND any(n IN nodes(path) WHERE n.name CONTAINS "钢主梁")
   AND any(n IN nodes(path) WHERE n.name CONTAINS "涂装")
@@ -91,13 +117,13 @@ RETURN [n IN nodes(path) WHERE NOT n:指标 | n.name] AS 层级路径,
        ind.`规范条款` AS 规范条款, ind.`参数取值范围` AS 参数取值范围 LIMIT 30
 
 示例：钢桥面板依据什么规范条款？
-MATCH path=(root:单项工程)-[:包含*0..7]->(parent)-[:包含指标]->(ind:指标)
+MATCH path=(root:单位工程)-[:包含*0..7]->(parent)-[:包含指标]->(ind:指标)
 WHERE any(n IN nodes(path) WHERE n.name CONTAINS "钢桥面板")
 RETURN [n IN nodes(path) WHERE NOT n:指标 | n.name] AS 层级路径,
        ind.name AS 指标, ind.`规范条款` AS 规范条款 LIMIT 30
 
 示例：涂装的主控项目有哪些？
-MATCH path=(root:单项工程)-[:包含*0..7]->(parent)-[:包含指标]->(ind:指标)
+MATCH path=(root:单位工程)-[:包含*0..7]->(parent)-[:包含指标]->(ind:指标)
 WHERE any(n IN nodes(path) WHERE n.name CONTAINS "涂装")
   AND ind.`检验项目类型` CONTAINS "主控"
 RETURN [n IN nodes(path) WHERE NOT n:指标 | n.name] AS 层级路径,
@@ -105,24 +131,83 @@ RETURN [n IN nodes(path) WHERE NOT n:指标 | n.name] AS 层级路径,
        ind.`参数取值范围` AS 参数取值范围 LIMIT 30
 
 示例：扭矩系数范围是多少？（指标名称也可能记录在细目中）
-MATCH path=(root:单项工程)-[:包含*0..7]->(parent)-[:包含指标]->(ind:指标)
+MATCH path=(root:单位工程)-[:包含*0..7]->(parent)-[:包含指标]->(ind:指标)
 WHERE any(n IN nodes(path) WHERE n.name CONTAINS "扭矩系数")
 RETURN [n IN nodes(path) WHERE NOT n:指标 | n.name] AS 层级路径,
        ind.name AS 指标, ind.`参数取值范围` AS 参数取值范围,
        ind.`是否可量化指标` AS 是否可量化指标 LIMIT 30
+
+示例：[B]第5.4.2条的具体内容是什么？
+MATCH standardPath=(standard:准则)-[:包含*1..4]->(clause:条款)-[:包含]->(content:条款内容)
+WHERE standard.name = "铁路混凝土工程施工质量验收标准" AND clause.name = "5.4.2"
+RETURN [n IN nodes(standardPath) WHERE n:一级标题 OR n:二级标题 OR n:项目类别 | n.name] AS 标题路径,
+       standard.name AS 准则, clause.`条款号` AS 条款号, content.name AS 条款内容,
+       content.`备注` AS 备注, content.`PDF页码` AS PDF页码 LIMIT 30
+
+示例：已查到“直螺纹接头拧紧力矩”后追问“这条规范的具体内容是什么？”
+MATCH engineeringPath=(root:单位工程)-[:包含*0..7]->(parent)-[:包含指标]->(ind:指标)
+MATCH (ind)-[:依据]->(clause:条款)-[:包含]->(content:条款内容),
+      standardPath=(standard:准则)-[:包含*1..4]->(clause)
+WHERE any(n IN nodes(engineeringPath) WHERE n.name CONTAINS "5 承台")
+  AND any(n IN nodes(engineeringPath) WHERE n.name CONTAINS "钻孔桩和挖孔桩")
+  AND any(n IN nodes(engineeringPath) WHERE n.name CONTAINS "钢筋（连接及安装）")
+  AND any(n IN nodes(engineeringPath) WHERE n.name CONTAINS "直螺纹接头拧紧力矩")
+  AND ind.`检验项目类型` CONTAINS "主控"
+RETURN DISTINCT [n IN nodes(standardPath) WHERE n:一级标题 OR n:二级标题 OR n:项目类别 | n.name] AS 标题路径,
+       standard.name AS 准则, clause.`条款号` AS 条款号, content.name AS 条款内容,
+       content.`备注` AS 备注, content.`PDF页码` AS PDF页码 LIMIT 30
 """
 
 # ============ 核心函数 ============
 
-def generate_cypher(question: str) -> str:
+def get_history(conversation_id: str) -> list:
+    """返回会话历史快照，避免在模型调用期间长期持有锁。"""
+    with conversation_lock:
+        return [dict(turn) for turn in conversation_store.get(conversation_id, ())]
+
+
+def save_turn(conversation_id: str, question: str, answer: str) -> None:
+    """只保存已完整结束的问答，限制单轮长度以控制模型上下文。"""
+    turn = {
+        "question": question[:MAX_HISTORY_QUESTION_CHARS],
+        "answer": answer[:MAX_HISTORY_ANSWER_CHARS],
+    }
+    with conversation_lock:
+        conversation_store[conversation_id].append(turn)
+
+
+def clear_history(conversation_id: str) -> None:
+    with conversation_lock:
+        conversation_store.pop(conversation_id, None)
+
+
+def history_messages(history: list) -> list:
+    """把最近多轮问答转换为模型可识别的对话消息。"""
+    messages = []
+    for turn in history[-MAX_HISTORY_TURNS:]:
+        messages.extend([
+            {"role": "user", "content": turn["question"]},
+            {"role": "assistant", "content": turn["answer"]},
+        ])
+    return messages
+
+
+def generate_cypher(question: str, history: list) -> str:
     """调用大模型返回业务查询或 GENERAL_QUESTION 分类标记。"""
     try:
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(history_messages(history))
+        messages.append({
+            "role": "user",
+            "content": (
+                f"当前用户问题：{question}\n"
+                "结合前面对话解析省略信息和代词指向；必须针对当前问题重新判断是否需要查询。"
+                "只返回本轮所需的一条 Cypher 或 GENERAL_QUESTION："
+            ),
+        })
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"用户问题：{question}\n返回 Cypher 或 GENERAL_QUESTION："}
-            ],
+            messages=messages,
             temperature=0.1,
             max_tokens=1500,
             extra_body={"enable_thinking": False},
@@ -172,22 +257,22 @@ def execute_query(cypher: str) -> list:
         raise RuntimeError("图谱查询失败，请检查数据库连接及生成的 Cypher。") from e
 
 
-def stream_answer(question: str, data: list, general_answer: bool = False):
+def stream_answer(question: str, data: list, history: list, general_answer: bool = False):
     """逐段生成答案；关闭响应时释放上游连接。"""
     response = None
     try:
         if general_answer:
-            system_prompt = "你是中文问答助手，直接回答用户的普通问题。本次未查询知识图谱，不得声称答案来自图谱或数据库。不确定的内容应明确说明，不编造工程验收条款或数值依据。使用 Markdown 清晰排版。"
-            user_prompt = question
+            system_prompt = "你是中文问答助手。结合前面对话直接回答当前普通问题。本次未查询知识图谱，不得声称答案来自图谱或数据库。不确定的内容应明确说明，不编造工程验收条款或数值依据。使用 Markdown 清晰排版。"
+            user_prompt = f"当前问题：{question}"
         else:
-            system_prompt = "仅依据查询结果回答问题。保留工程和细目上下文、规范条款及数值单位。不要输出记录编号、节点ID或其他系统内部标识，不混合不同记录的取值范围。空属性表示未提供，不得补造。结果为空时明确说明未找到相关数据，不使用常识补充验收标准。多条结果用列表呈现。"
-            user_prompt = f"用户问题：{question}\n查询结果：{json.dumps(data, ensure_ascii=False, indent=2)}\n回答："
+            system_prompt = "结合前面对话理解当前问题，但仅依据本轮查询结果回答工程验收事实和规范正文。最新查询结果优先于历史回答。保留工程、细目、准则、标题路径、条款号、完整条款内容、PDF页码及数值单位。用户追问条款具体内容时，应完整呈现查询到的条款正文并注明准则和PDF页码。不要输出记录编号、节点ID或其他系统内部标识，不混合不同记录的取值范围。空属性表示源数据未提供，不得补造。结果为空时明确说明未找到相关数据，不使用历史回答或常识补充验收标准。多条结果用列表呈现。"
+            user_prompt = f"当前问题：{question}\n本轮查询结果：{json.dumps(data, ensure_ascii=False, indent=2)}\n请综合上下文回答当前问题："
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(history_messages(history))
+        messages.append({"role": "user", "content": user_prompt})
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
+            messages=messages,
             temperature=0.3,
             max_tokens=1500,
             stream=True,
@@ -244,6 +329,9 @@ def ask_post():
     if not isinstance(data, dict) or not isinstance(data.get("question"), str) or not data["question"].strip():
         return jsonify({"success": False, "error": "请提供非空 question 参数"}), 400
     question = data["question"]
+    conversation_id = data.get("conversation_id")
+    if not isinstance(conversation_id, str) or not CONVERSATION_ID_PATTERN.fullmatch(conversation_id):
+        return jsonify({"success": False, "error": "请提供有效的 conversation_id"}), 400
     limit = data.get("limit", 20)
     if type(limit) is not int or limit <= 0:
         return jsonify({"success": False, "error": "limit 必须为正整数"}), 400
@@ -255,9 +343,10 @@ def ask_post():
         fetched_rows = returned_rows = 0
         first_text_ms = None
         try:
+            history = get_history(conversation_id)
             yield stream_event("status", {"message": "正在分析问题…"})
             with measure_stage(timings, "generate_cypher_ms"):
-                cypher = generate_cypher(question)
+                cypher = generate_cypher(question, history)
             general_answer = cypher == "GENERAL_QUESTION"
             results = []
             if general_answer:
@@ -272,9 +361,11 @@ def ask_post():
             yield stream_event("status", {"message": "正在生成回答…"})
             with measure_stage(timings, "answer_ms"):
                 answer_started = perf_counter()
-                upstream = stream_answer(question, results, general_answer=general_answer)
+                upstream = stream_answer(question, results, history, general_answer=general_answer)
+                answer_parts = []
                 try:
                     for content in upstream:
+                        answer_parts.append(content)
                         if first_text_ms is None:
                             first_text_ms = round((perf_counter() - answer_started) * 1000, 2)
                             if general_answer:
@@ -282,8 +373,12 @@ def ask_post():
                         yield stream_event("delta", {"text": content})
                 finally:
                     upstream.close()
+            save_turn(conversation_id, question, "".join(answer_parts))
             status = "成功"
-            yield stream_event("done", {"cypher": cypher, "data": results})
+            yield stream_event("done", {
+                "cypher": cypher, "data": results,
+                "history_turns": len(get_history(conversation_id)),
+            })
         except GeneratorExit:
             if status != "成功":
                 status = "连接中断"
@@ -304,6 +399,15 @@ def ask_post():
     return Response(events(), mimetype="text/event-stream", headers={
         "Cache-Control": "no-cache", "X-Accel-Buffering": "no",
     })
+
+
+@app.route("/conversation/<conversation_id>", methods=["DELETE"])
+def delete_conversation(conversation_id):
+    """清空当前浏览器会话的服务端多轮记忆。"""
+    if not CONVERSATION_ID_PATTERN.fullmatch(conversation_id):
+        return jsonify({"success": False, "error": "conversation_id 无效"}), 400
+    clear_history(conversation_id)
+    return jsonify({"success": True})
 
 
 @app.route("/health")

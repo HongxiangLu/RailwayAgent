@@ -9,3 +9,12 @@ __pycache__/
 
 # 知识图谱导入数据
 data/*
+
+# 规范条款数据
+app/static/standard_media/
+
+# IDE 配置
+.idea/
+
+# 测试脚本
+tests/

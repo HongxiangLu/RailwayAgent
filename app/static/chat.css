@@ -184,6 +184,61 @@ body {
 
 .markdown-body img {
     max-width: 100%;
+    max-height: 560px;
+    display: block;
+    margin: 10px auto;
+    padding: 6px;
+    object-fit: contain;
+    background: #fff;
+    border: 1px solid #e1e5ea;
+    border-radius: 8px;
+}
+
+.clause-assets {
+    margin-top: 12px;
+    padding: 10px 12px;
+    background: #f8fbff;
+    border: 1px solid #d8e7fb;
+    border-radius: 8px;
+}
+
+.clause-assets summary {
+    color: #0d47a1;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.clause-assets section,
+.clause-assets figure {
+    margin-top: 12px;
+}
+
+.clause-assets h4 {
+    margin: 0 0 6px;
+    font-size: 13px;
+}
+
+.clause-assets .asset-table {
+    max-height: 480px;
+    overflow: auto;
+}
+
+.clause-assets figure img {
+    max-width: 100%;
+    max-height: 560px;
+    display: block;
+    margin: 0 auto;
+    object-fit: contain;
+    background: white;
+    border: 1px solid #e1e5ea;
+    border-radius: 8px;
+}
+
+.clause-assets figcaption {
+    margin-top: 6px;
+    color: #666;
+    font-size: 12px;
+    text-align: center;
 }
 
 .message .bubble .cypher {

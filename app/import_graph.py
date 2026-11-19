@@ -16,6 +16,12 @@ from openpyxl import load_workbook
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, ServiceUnavailable
 
+try:
+    from app.standard_assets import asset_note, read_standard_assets
+except ModuleNotFoundError:
+    # 兼容在 PyCharm 中直接右键运行 app/import_graph.py。
+    from standard_assets import asset_note, read_standard_assets
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EXCEL_PATH = PROJECT_ROOT / "data" / "知识图谱260924.xlsx"
@@ -23,8 +29,11 @@ DEFAULT_STANDARD_PATHS = [
     PROJECT_ROOT / "data" / "TB10752-2018高速铁路桥涵工程施工质量验收标准.xlsx",
     PROJECT_ROOT / "data" / "TB10424-2018铁路混凝土工程施工质量验收标准.xlsx",
 ]
+STANDARD_MEDIA_ROOT = PROJECT_ROOT / "app" / "static" / "standard_media"
 STANDARD_SHEET = "条款总表"
-STANDARD_COLUMNS = ["准则", "一级标题", "二级标题", "项目类别", "条款号", "条款内容", "PDF页码"]
+STANDARD_HIERARCHY_COLUMNS = ["准则", "一级标题", "二级标题", "三级标题", "项目类别"]
+STANDARD_REQUIRED_COLUMNS = ["准则", "一级标题", "条款号", "条款内容", "PDF页码"]
+STANDARD_COLUMNS = STANDARD_HIERARCHY_COLUMNS + ["条款号", "条款内容", "PDF页码"]
 STANDARD_BY_CODE = {
     "A": "高速铁路桥涵工程施工质量验收标准",
     "B": "铁路混凝土工程施工质量验收标准",
@@ -43,7 +52,10 @@ PROJECT_COLUMNS = [source_column for source_column, _ in PROJECT_LEVELS]
 PROJECT_LABELS = [graph_label for _, graph_label in PROJECT_LEVELS]
 DETAIL_COLUMNS = [f"施工质量验收标准{level}级细目" for level in "一二三四"]
 PROPERTY_COLUMNS = ["检验项目类型", "规范条款", "是否可量化指标", "参数取值范围"]
-STANDARD_LABELS = ["准则", "一级标题", "二级标题", "项目类别", "条款", "条款内容"]
+STANDARD_LABELS = [
+    "准则", "一级标题", "二级标题", "三级标题", "项目类别",
+    "条款", "条款内容", "表格", "图片",
+]
 LABELS = PROJECT_LABELS + ["施工质量验收标准细目", "指标"] + STANDARD_LABELS
 BUSINESS_COLUMNS = PROJECT_COLUMNS + DETAIL_COLUMNS + ["指标"] + PROPERTY_COLUMNS
 LEGACY_LABELS = {
@@ -130,17 +142,17 @@ def read_standard_records(paths):
             sheet = workbook[STANDARD_SHEET]
             headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
             columns = {name: index for index, name in enumerate(headers) if name}
-            missing = [name for name in STANDARD_COLUMNS if name not in columns]
+            missing = [name for name in STANDARD_REQUIRED_COLUMNS if name not in columns]
             if missing:
                 raise ValueError(f"{path.name} 缺少列：{'、'.join(missing)}")
-            hierarchy_names = STANDARD_COLUMNS[:4]
+            hierarchy_names = STANDARD_HIERARCHY_COLUMNS
             inherited = {name: "" for name in hierarchy_names}
             for row_number, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), 2):
                 if not any(value not in (None, "") for value in row):
                     continue
                 record = {
-                    name: row[index] if index < len(row) else None
-                    for name, index in columns.items() if name in STANDARD_COLUMNS
+                    name: row[columns[name]] if name in columns and columns[name] < len(row) else None
+                    for name in STANDARD_COLUMNS
                 }
                 for level, name in enumerate(hierarchy_names):
                     current = text(record.get(name))
@@ -156,6 +168,10 @@ def read_standard_records(paths):
                 record["PDF页码"] = normalize_pdf_page(
                     row[columns["PDF页码"]] if columns["PDF页码"] < len(row) else None
                 )
+                # 新版工作簿中附录表索引和「本标准用词说明」没有条款号，
+                # 它们不是条款节点；对应表格仍会通过正文标注挂到实际条款。
+                if record["条款号"] in {"", "—", "-", "/"}:
+                    continue
                 # 源表中该行正文和相邻编号表明它实际是 1.0.10。
                 if (
                     record["准则"] == STANDARD_BY_CODE["A"]
@@ -178,6 +194,7 @@ def read_standard_records(paths):
                         f"位于第{seen[key]}行和第{row_number}行"
                     )
                 seen[key] = row_number
+                record["准则代码"] = STANDARD_CODE_BY_NAME[record["准则"]]
                 record["来源文件"] = path.name
                 records.append(record)
         finally:
@@ -249,12 +266,49 @@ def clause_id(standard_name, clause_number):
     return hierarchy_id("条款", standard_name, clause_number)
 
 
+def write_standard_asset(tx, current_clause_id, label, asset):
+    """写入条款下的表格或图片节点。"""
+    node_id = hierarchy_id(label, asset["准则"], asset["id"])
+    if label == "表格":
+        properties = {
+            "name": asset["标题"],
+            "表号": asset["编号"],
+            "内容": asset["内容"],
+            "备注": f"来源：{asset['工作表']}工作表"
+                    + (f"；扫描PDF第{asset['PDF页码']}页" if asset.get("PDF页码") else ""),
+            "PDF页码": asset.get("PDF页码"),
+            "来源文件": asset["来源文件"],
+            "工作表": asset["工作表"],
+        }
+    else:
+        properties = {
+            "name": asset["标题"],
+            "图号": asset["编号"],
+            "图片地址": asset["图片地址"],
+            "备注": f"来源：{asset['工作表']}工作表；图片地址：{asset['图片地址']}"
+                    + (f"；扫描PDF第{asset['PDF页码']}页" if asset.get("PDF页码") else ""),
+            "PDF页码": asset.get("PDF页码"),
+            "来源文件": asset["来源文件"],
+            "工作表": asset["工作表"],
+        }
+    tx.run(
+        f"MERGE (n:`{label}` {{id: $id}}) SET n += $properties",
+        id=node_id, properties=properties,
+    ).consume()
+    tx.run(
+        f"MATCH (c:条款 {{id: $clause_id}}), (n:`{label}` {{id: $asset_id}}) "
+        "MERGE (c)-[:包含]->(n)",
+        clause_id=current_clause_id, asset_id=node_id,
+    ).consume()
+
+
 def write_standard_record(tx, record):
     parent = None
     levels = [
         ("准则", record["准则"]),
         ("一级标题", record["一级标题"]),
         ("二级标题", record["二级标题"]),
+        ("三级标题", record.get("三级标题", "")),
         ("项目类别", record["项目类别"]),
     ]
     for label, name in levels:
@@ -289,7 +343,7 @@ def write_standard_record(tx, record):
 
     content_id = hierarchy_id("条款内容", current_clause_id, record["条款内容"])
     page = record["PDF页码"]
-    note = f"PDF第{page}页" if page not in (None, "") else ""
+    note = asset_note(record)
     tx.run(
         "MERGE (n:条款内容 {id: $id}) SET n.name = $content, n.`备注` = $note, "
         "n.`PDF页码` = $page, n.`来源文件` = $source_file",
@@ -301,6 +355,10 @@ def write_standard_record(tx, record):
         "MERGE (c)-[:包含]->(n)",
         clause_id=current_clause_id, content_id=content_id,
     ).consume()
+    for table in record.get("表格", []):
+        write_standard_asset(tx, current_clause_id, "表格", table)
+    for image in record.get("图片", []):
+        write_standard_asset(tx, current_clause_id, "图片", image)
 
 
 def write_record(tx, record):
@@ -388,12 +446,26 @@ def import_graph(
     excel_path, uri, user, password, database="neo4j", clear_database=False,
     standard_paths=None,
 ):
+    print("正在连接 Neo4j……", flush=True)
     with GraphDatabase.driver(uri, auth=(user, password)) as driver:
         driver.verify_connectivity()
+        print("Neo4j 连接成功，正在读取 Excel 数据……", flush=True)
         records = read_records(excel_path)
-        standard_records = read_standard_records(standard_paths or DEFAULT_STANDARD_PATHS)
+        selected_standard_paths = standard_paths or DEFAULT_STANDARD_PATHS
+        standard_records = read_standard_records(selected_standard_paths)
+        tables, images, table_links, image_links = read_standard_assets(
+            selected_standard_paths, standard_records, STANDARD_MEDIA_ROOT,
+        )
+        print(
+            f"Excel 读取完成：{len(records)} 条指标、"
+            f"{len(standard_records)} 条规范条款、{len(tables)} 个表格、"
+            f"{len(images)} 张图片；建立 {table_links} 个条款-表格关系、"
+            f"{image_links} 个条款-图片关系。",
+            flush=True,
+        )
         with driver.session(database=database) as session:
             if clear_database:
+                print(f"正在清空并重建数据库 {database}……", flush=True)
                 session.run("MATCH (n) DETACH DELETE n").consume()
                 drop_legacy_schema(session)
                 # 清空数据不会移除约束；只移除原导入模型的name唯一约束。
@@ -408,7 +480,7 @@ def import_graph(
                         name = constraint["name"].replace("`", "``")
                         session.run(f"DROP CONSTRAINT `{name}`").consume()
                         print(f"已移除旧name唯一约束：{name}")
-                print(f"已清空数据库：{database}")
+                print(f"已清空数据库：{database}", flush=True)
 
             for label in LABELS:
                 session.run(
@@ -418,12 +490,18 @@ def import_graph(
             for count, record in enumerate(standard_records, 1):
                 session.execute_write(write_standard_record, record)
                 if count % 100 == 0:
-                    print(f"已导入 {count}/{len(standard_records)} 条规范条款")
-            print(f"规范条款导入完成：{len(standard_records)} 条")
+                    print(
+                        f"已导入 {count}/{len(standard_records)} 条规范条款",
+                        flush=True,
+                    )
+            print(f"规范条款导入完成：{len(standard_records)} 条", flush=True)
             for count, record in enumerate(records, 1):
                 session.execute_write(write_record, record)
                 if count % 100 == 0:
-                    print(f"已导入 {count}/{len(records)} 条指标记录")
+                    print(
+                        f"已导入 {count}/{len(records)} 条指标记录",
+                        flush=True,
+                    )
             linked_indicators = session.run(
                 "MATCH (n:指标)-[:依据]->(:条款) RETURN count(DISTINCT n) AS count"
             ).single()["count"]
@@ -432,7 +510,10 @@ def import_graph(
             ).single()["count"]
         print(
             f"导入完成：{len(records)} 条指标、{len(standard_records)} 条规范条款；"
-            f"{linked_indicators} 条指标建立 {reference_links} 条依据关系；数据库：{database}"
+            f"{linked_indicators} 条指标建立 {reference_links} 条依据关系；"
+            f"条款附件：{table_links} 个表格关系、{image_links} 个图片关系；"
+            f"数据库：{database}",
+            flush=True,
         )
 
 
@@ -465,7 +546,8 @@ def main():
         print(f"规范：{path}")
     print(f"Neo4j：{neo4j_uri} / {neo4j_database}")
     print("图谱层级：单位工程 → 工程项目类别 → 工程项目子类别 → 分项工程")
-    print("规范层级：准则 → 一级标题 → 二级标题 → 项目类别 → 条款 → 条款内容")
+    print("规范层级：准则 → 一级标题 → 二级标题 → 三级标题 → 项目类别 → 条款")
+    print("条款内容及附件：条款 → 条款内容 / 表格 / 图片")
     print("=" * 60, flush=True)
     try:
         import_graph(

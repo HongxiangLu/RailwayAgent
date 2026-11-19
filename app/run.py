@@ -48,6 +48,14 @@ MAX_HISTORY_TURNS = 10
 MAX_HISTORY_QUESTION_CHARS = 2000
 MAX_HISTORY_ANSWER_CHARS = 4000
 CONVERSATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+EXPLICIT_CLAUSE_PATTERN = re.compile(
+    r"\[([AB])\]\s*第?\s*([A-Z](?:\.\d+)+|\d+(?:\.\d+)+)\s*条?",
+    re.IGNORECASE,
+)
+STANDARD_BY_CODE = {
+    "A": "高速铁路桥涵工程施工质量验收标准",
+    "B": "铁路混凝土工程施工质量验收标准",
+}
 conversation_store = defaultdict(lambda: deque(maxlen=MAX_HISTORY_TURNS))
 conversation_lock = Lock()
 
@@ -55,7 +63,7 @@ conversation_lock = Lock()
 SYSTEM_PROMPT = """
 你负责判断问题类型，并为工程质量验收及规范条文问题生成 Neo4j 查询。
 先判断问题是否属于工程质量验收图谱业务范围：
-- 工程层级、验收标准、规范条款正文、PDF页码、检验项目、指标或取值范围问题：只输出一条只读 Cypher，不输出解释。
+- 工程层级、验收标准、规范条款正文、PDF页码、条款表格、条款图片、检验项目、指标或取值范围问题：只输出一条只读 Cypher，不输出解释。
 - 明确与上述业务无关的普通问题：只输出 GENERAL_QUESTION，不生成查询。
 - 业务问题即使可能没有数据、使用同义词或问法不同，也必须查询图谱；混合问题中涉及验收依据的部分优先查询。
 - 不得用 RETURN 常量将自身知识伪装为数据库结果，不得因用户要求跳过查询而改变业务问题的分类。
@@ -70,10 +78,13 @@ SYSTEM_PROMPT = """
 - 施工质量验收标准细目：属性 id、name、层级（整数1至4）。
 - 指标：id 是记录编号，name 可以为空；另有字符串属性
   检验项目类型、规范条款、是否可量化指标、参数取值范围。
-- 规范条文图谱顺序为 准则-[:包含]->一级标题-[:包含]->二级标题-[:包含]->
-  项目类别-[:包含]->条款-[:包含]->条款内容；空标题或“—”会跳过，因此从准则到条款
-  应使用 [:包含*1..4]。条款属性有 name、条款号、准则代码；条款内容属性有 name、
-  备注、PDF页码、来源文件，其中 name 是完整正文，备注格式为“PDF第N页”。
+- 规范条文主路径为 准则-[:包含]->一级标题-[:包含]->二级标题-[:包含]->三级标题-[:包含]->
+  项目类别-[:包含]->条款；空标题或“—”会跳过，因此从准则到条款应使用 [:包含*1..5]。
+  条款通过 [:包含] 分别连接 条款内容、表格、图片。条款属性有 name、条款号、准则代码；
+  条款内容属性有 name、备注、PDF页码、来源文件，其中 name 是完整正文，备注会列出PDF页码、
+  相关表格和图片。表格属性有 name、表号、内容、备注、PDF页码、来源文件、工作表，其中内容是
+  可直接在前端渲染的 Markdown 表格。图片属性有 name、图号、图片地址、备注、PDF页码、来源文件、
+  工作表，图片地址是以 /static/ 开头的前端路径。
 - 准则代码 A 对应“高速铁路桥涵工程施工质量验收标准”，B 对应
   “铁路混凝土工程施工质量验收标准”。指标通过 [:依据] 指向已解析出的条款。
 - 所有层级节点通过 包含 关系连接；完整顺序是单位工程、工程项目类别、
@@ -93,14 +104,20 @@ SYSTEM_PROMPT = """
 4. 返回普通标量或列表/映射，不返回原始 path、node、relationship。
    指标明细保留工程/细目路径，避免混淆同名指标。id、记录编号及节点内部标识仅供系统使用，
    不得投影到 RETURN 或返回的映射中，也不得换别名返回。不要返回 properties(node) 或 node{.*}。
-5. 只使用 MATCH、WHERE、WITH、RETURN、ORDER BY、LIMIT 等只读查询子句；
+5. 只使用 MATCH、OPTIONAL MATCH、WHERE、WITH、RETURN、ORDER BY、LIMIT 等只读查询子句；
    不使用写入语句或过程调用。默认 LIMIT 30。不编造数据库中不存在的字段。
 6. 对细目或指标的要求查询，应返回条款、检验项目类型、参数取值范围，空属性不能猜测。
 7. 用户询问“这条规范的具体内容”“上述条款内容”等追问时，必须结合历史中的条款号或
-   指标，沿 (指标)-[:依据]->(条款)-[:包含]->(条款内容) 查询。返回准则、条款号、
-   完整条款内容、备注/PDF页码以及标题路径。不能只复述指标的规范条款属性。
+   指标，沿 (指标)-[:依据]->(条款)-[:包含]->(条款内容) 查询，并用 OPTIONAL MATCH 查询同一
+   条款下的表格和图片。返回准则、条款号、完整条款内容、备注/PDF页码、标题路径、相关表格、
+   相关图片。不能只复述指标的规范条款属性。
 8. 直接按 [A]/[B] 条款查询时，将代码映射为对应准则，并去掉“第”“条”后匹配条款号；
    例如 [B]第5.4.2条匹配 B 准则下 name="5.4.2" 的条款。
+9. 用户询问某条的表格、允许偏差表、图或示意图时，必须返回表格.内容或图片.图片地址；
+   图片在最终回答中用 Markdown `![图片标题](图片地址)` 展示，表格内容保持 Markdown 表格格式。
+10. 用户按表题、图题或附件正文中的关键词检索时，同时搜索 table.name、table.`内容`、
+    image.name、image.`备注` 和 content.`备注`。询问“所有表格/所有图片”时直接匹配 表格/图片
+    节点并返回所属准则和条款号，不能只搜索条款正文。
 
 示例：桥梁工程包含哪些工程项目类别？
 MATCH (root:单位工程)-[:包含]->(category:工程项目类别)
@@ -138,24 +155,52 @@ RETURN [n IN nodes(path) WHERE NOT n:指标 | n.name] AS 层级路径,
        ind.`是否可量化指标` AS 是否可量化指标 LIMIT 30
 
 示例：[B]第5.4.2条的具体内容是什么？
-MATCH standardPath=(standard:准则)-[:包含*1..4]->(clause:条款)-[:包含]->(content:条款内容)
+MATCH standardPath=(standard:准则)-[:包含*1..5]->(clause:条款)
 WHERE standard.name = "铁路混凝土工程施工质量验收标准" AND clause.name = "5.4.2"
-RETURN [n IN nodes(standardPath) WHERE n:一级标题 OR n:二级标题 OR n:项目类别 | n.name] AS 标题路径,
+MATCH (clause)-[:包含]->(content:条款内容)
+OPTIONAL MATCH (clause)-[:包含]->(table:表格)
+OPTIONAL MATCH (clause)-[:包含]->(image:图片)
+RETURN [n IN nodes(standardPath) WHERE n:一级标题 OR n:二级标题 OR n:三级标题 OR n:项目类别 | n.name] AS 标题路径,
        standard.name AS 准则, clause.`条款号` AS 条款号, content.name AS 条款内容,
-       content.`备注` AS 备注, content.`PDF页码` AS PDF页码 LIMIT 30
+       content.`备注` AS 备注, content.`PDF页码` AS PDF页码,
+       collect(DISTINCT table{.name, .`表号`, .`内容`, .`备注`, .`PDF页码`}) AS 相关表格,
+       collect(DISTINCT image{.name, .`图号`, .`图片地址`, .`备注`, .`PDF页码`}) AS 相关图片 LIMIT 30
+
+示例：查找转体就位后梁体允许偏差的表格。
+MATCH standardPath=(standard:准则)-[:包含*1..5]->(clause:条款)
+MATCH (clause)-[:包含]->(table:表格)
+WHERE table.name CONTAINS "转体就位后梁体" OR table.`内容` CONTAINS "转体就位后梁体"
+OPTIONAL MATCH (clause)-[:包含]->(content:条款内容)
+RETURN [n IN nodes(standardPath) WHERE n:一级标题 OR n:二级标题 OR n:三级标题 OR n:项目类别 | n.name] AS 标题路径,
+       standard.name AS 准则, clause.`条款号` AS 条款号, content.name AS 条款内容,
+       content.`备注` AS 备注, table.name AS 表格标题, table.`表号` AS 表号,
+       table.`内容` AS 表格内容, table.`PDF页码` AS 表格PDF页码 LIMIT 30
+
+示例：查询图D.0.1—1。
+MATCH standardPath=(standard:准则)-[:包含*1..5]->(clause:条款)
+MATCH (clause)-[:包含]->(image:图片)
+WHERE image.name CONTAINS "D.0.1—1" OR image.`图号` = "D.0.1—1"
+RETURN [n IN nodes(standardPath) WHERE n:一级标题 OR n:二级标题 OR n:三级标题 OR n:项目类别 | n.name] AS 标题路径,
+       standard.name AS 准则, clause.`条款号` AS 条款号,
+       image.name AS 图片标题, image.`图号` AS 图号, image.`图片地址` AS 图片地址,
+       image.`备注` AS 图片备注, image.`PDF页码` AS 图片PDF页码 LIMIT 30
 
 示例：已查到“直螺纹接头拧紧力矩”后追问“这条规范的具体内容是什么？”
 MATCH engineeringPath=(root:单位工程)-[:包含*0..7]->(parent)-[:包含指标]->(ind:指标)
 MATCH (ind)-[:依据]->(clause:条款)-[:包含]->(content:条款内容),
-      standardPath=(standard:准则)-[:包含*1..4]->(clause)
+      standardPath=(standard:准则)-[:包含*1..5]->(clause)
 WHERE any(n IN nodes(engineeringPath) WHERE n.name CONTAINS "5 承台")
   AND any(n IN nodes(engineeringPath) WHERE n.name CONTAINS "钻孔桩和挖孔桩")
   AND any(n IN nodes(engineeringPath) WHERE n.name CONTAINS "钢筋（连接及安装）")
   AND any(n IN nodes(engineeringPath) WHERE n.name CONTAINS "直螺纹接头拧紧力矩")
   AND ind.`检验项目类型` CONTAINS "主控"
-RETURN DISTINCT [n IN nodes(standardPath) WHERE n:一级标题 OR n:二级标题 OR n:项目类别 | n.name] AS 标题路径,
+OPTIONAL MATCH (clause)-[:包含]->(table:表格)
+OPTIONAL MATCH (clause)-[:包含]->(image:图片)
+RETURN [n IN nodes(standardPath) WHERE n:一级标题 OR n:二级标题 OR n:三级标题 OR n:项目类别 | n.name] AS 标题路径,
        standard.name AS 准则, clause.`条款号` AS 条款号, content.name AS 条款内容,
-       content.`备注` AS 备注, content.`PDF页码` AS PDF页码 LIMIT 30
+       content.`备注` AS 备注, content.`PDF页码` AS PDF页码,
+       collect(DISTINCT table{.name, .`表号`, .`内容`, .`备注`, .`PDF页码`}) AS 相关表格,
+       collect(DISTINCT image{.name, .`图号`, .`图片地址`, .`备注`, .`PDF页码`}) AS 相关图片 LIMIT 30
 """
 
 # ============ 核心函数 ============
@@ -192,8 +237,32 @@ def history_messages(history: list) -> list:
     return messages
 
 
+def explicit_clause_cypher(question: str) -> str | None:
+    """明确的 [A]/[B] 条款查询使用固定模板，避免 OPTIONAL MATCH 改变过滤语义。"""
+    match = EXPLICIT_CLAUSE_PATTERN.search(question)
+    if not match:
+        return None
+    code = match.group(1).upper()
+    clause_number = match.group(2).upper()
+    standard_name = STANDARD_BY_CODE[code]
+    return f'''MATCH standardPath=(standard:准则)-[:包含*1..5]->(clause:条款)
+WHERE standard.name = "{standard_name}" AND clause.`条款号` = "{clause_number}"
+MATCH (clause)-[:包含]->(content:条款内容)
+OPTIONAL MATCH (clause)-[:包含]->(table:表格)
+OPTIONAL MATCH (clause)-[:包含]->(image:图片)
+RETURN [n IN nodes(standardPath) WHERE n:一级标题 OR n:二级标题 OR n:三级标题 OR n:项目类别 | n.name] AS 标题路径,
+       standard.name AS 准则, clause.`条款号` AS 条款号, content.name AS 条款内容,
+       content.`备注` AS 备注, content.`PDF页码` AS PDF页码,
+       collect(DISTINCT table{{.name, .`表号`, .`内容`, .`备注`, .`PDF页码`}}) AS 相关表格,
+       collect(DISTINCT image{{.name, .`图号`, .`图片地址`, .`备注`, .`PDF页码`}}) AS 相关图片
+LIMIT 30'''
+
+
 def generate_cypher(question: str, history: list) -> str:
     """调用大模型返回业务查询或 GENERAL_QUESTION 分类标记。"""
+    direct_query = explicit_clause_cypher(question)
+    if direct_query:
+        return direct_query
     try:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(history_messages(history))
@@ -247,12 +316,65 @@ def public_query_data(value):
     return value
 
 
+def enrich_clause_results(session, rows: list) -> list:
+    """只要结果包含准则和条款号，就自动补齐正文、备注、表格和图片。"""
+    keys = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        standard_name = row.get("准则")
+        clause_number = row.get("条款号")
+        if isinstance(standard_name, str) and standard_name and isinstance(clause_number, str) and clause_number:
+            keys.append({
+                "result_index": index,
+                "standard_name": standard_name,
+                "clause_number": clause_number,
+            })
+    if not keys:
+        return rows
+
+    query = """
+    UNWIND $keys AS key
+    MATCH (standard:准则)-[:包含*1..5]->(clause:条款)
+    WHERE standard.name = key.standard_name AND clause.`条款号` = key.clause_number
+    OPTIONAL MATCH (clause)-[:包含]->(content:条款内容)
+    WITH key, head([item IN collect(DISTINCT content{
+        .name, .`备注`, .`PDF页码`, .`来源文件`
+    }) WHERE item IS NOT NULL]) AS content
+    OPTIONAL MATCH (standard:准则 {name: key.standard_name})-[:包含*1..5]->
+                   (clause:条款 {条款号: key.clause_number})-[:包含]->(table:表格)
+    WITH key, content, [item IN collect(DISTINCT table{
+        .name, .`表号`, .`内容`, .`备注`, .`PDF页码`, .`来源文件`
+    }) WHERE item IS NOT NULL] AS tables
+    OPTIONAL MATCH (standard:准则 {name: key.standard_name})-[:包含*1..5]->
+                   (clause:条款 {条款号: key.clause_number})-[:包含]->(image:图片)
+    RETURN key.result_index AS result_index, content,
+           tables AS related_tables,
+           [item IN collect(DISTINCT image{
+               .name, .`图号`, .`图片地址`, .`备注`, .`PDF页码`, .`来源文件`
+           }) WHERE item IS NOT NULL] AS related_images
+    """
+    for extra in session.run(query, keys=keys).data():
+        target = rows[extra["result_index"]]
+        content = extra.get("content") or {}
+        if content:
+            target.setdefault("条款内容", content.get("name"))
+            target.setdefault("备注", content.get("备注"))
+            target.setdefault("PDF页码", content.get("PDF页码"))
+        if extra.get("related_tables"):
+            target["相关表格"] = extra["related_tables"]
+        if extra.get("related_images"):
+            target["相关图片"] = extra["related_images"]
+    return rows
+
+
 def execute_query(cypher: str) -> list:
     """执行 Cypher 查询"""
     try:
         with driver.session(database=NEO4J_DATABASE) as session:
             result = session.run(cypher)
-            return public_query_data(result.data())
+            rows = public_query_data(result.data())
+            return public_query_data(enrich_clause_results(session, rows))
     except Exception as e:
         raise RuntimeError("图谱查询失败，请检查数据库连接及生成的 Cypher。") from e
 
@@ -265,7 +387,7 @@ def stream_answer(question: str, data: list, history: list, general_answer: bool
             system_prompt = "你是中文问答助手。结合前面对话直接回答当前普通问题。本次未查询知识图谱，不得声称答案来自图谱或数据库。不确定的内容应明确说明，不编造工程验收条款或数值依据。使用 Markdown 清晰排版。"
             user_prompt = f"当前问题：{question}"
         else:
-            system_prompt = "结合前面对话理解当前问题，但仅依据本轮查询结果回答工程验收事实和规范正文。最新查询结果优先于历史回答。保留工程、细目、准则、标题路径、条款号、完整条款内容、PDF页码及数值单位。用户追问条款具体内容时，应完整呈现查询到的条款正文并注明准则和PDF页码。不要输出记录编号、节点ID或其他系统内部标识，不混合不同记录的取值范围。空属性表示源数据未提供，不得补造。结果为空时明确说明未找到相关数据，不使用历史回答或常识补充验收标准。多条结果用列表呈现。"
+            system_prompt = "结合前面对话理解当前问题，但仅依据本轮查询结果回答工程验收事实和规范正文。最新查询结果优先于历史回答。保留工程、细目、准则、标题路径、条款号、完整条款内容、PDF页码及数值单位。用户追问条款具体内容时，应完整呈现查询到的条款正文并注明准则和PDF页码。查询结果含相关表格时，使用其‘内容’原样输出Markdown表格；含相关图片时，使用 `![图片标题](图片地址)` 输出，使前端直接显示图片，并保留图号和页码。不要输出记录编号、节点ID或其他系统内部标识，不混合不同记录的取值范围。空属性表示源数据未提供，不得补造。结果为空时明确说明未找到相关数据，不使用历史回答或常识补充验收标准。多条结果用列表呈现。"
             user_prompt = f"当前问题：{question}\n本轮查询结果：{json.dumps(data, ensure_ascii=False, indent=2)}\n请综合上下文回答当前问题："
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(history_messages(history))
@@ -274,7 +396,7 @@ def stream_answer(question: str, data: list, history: list, general_answer: bool
             model=OPENAI_MODEL,
             messages=messages,
             temperature=0.3,
-            max_tokens=1500,
+            max_tokens=4000,
             stream=True,
             extra_body={"enable_thinking": False},
         )

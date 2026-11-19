@@ -45,6 +45,7 @@ async function sendMessage() {
             completed = true;
             clearTimeout(timer);
             redraw();
+            appendClauseAssets(bubble, payload.data || []);
             let extra = '';
             if (payload.cypher) extra += `<div class="cypher">🔍 ${escapeHtml(payload.cypher)}</div>`;
             if (payload.data && payload.data.length) {
@@ -103,6 +104,63 @@ async function sendMessage() {
         sendBtn.disabled = false;
         input.focus();
     }
+}
+
+// ============ 展示条款的完整表格和图片 ============
+function appendClauseAssets(bubble, rows) {
+    const tableMap = new Map();
+    const imageMap = new Map();
+    for (const row of rows) {
+        for (const table of (row && row['相关表格']) || []) {
+            if (!table) continue;
+            const key = `${table['表号'] || ''}|${table.name || ''}|${table['内容'] || ''}`;
+            tableMap.set(key, table);
+        }
+        for (const image of (row && row['相关图片']) || []) {
+            if (!image || !image['图片地址']) continue;
+            imageMap.set(image['图片地址'], image);
+        }
+    }
+    if (!tableMap.size && !imageMap.size) return;
+
+    const details = document.createElement('details');
+    details.className = 'clause-assets';
+    details.open = true;
+    const summary = document.createElement('summary');
+    summary.textContent = `完整附件（${tableMap.size} 个表格，${imageMap.size} 张图片）`;
+    details.appendChild(summary);
+
+    for (const table of tableMap.values()) {
+        const section = document.createElement('section');
+        const title = document.createElement('h4');
+        title.textContent = table.name || table['表号'] || '相关表格';
+        section.appendChild(title);
+        const content = document.createElement('div');
+        content.className = 'markdown-body asset-table';
+        const markdown = table['内容'] || '';
+        if (window.marked && window.DOMPurify) {
+            content.innerHTML = DOMPurify.sanitize(marked.parse(markdown, { gfm: true }));
+        } else {
+            content.textContent = markdown;
+            content.style.whiteSpace = 'pre-wrap';
+        }
+        section.appendChild(content);
+        details.appendChild(section);
+    }
+
+    for (const image of imageMap.values()) {
+        const figure = document.createElement('figure');
+        const picture = document.createElement('img');
+        picture.src = image['图片地址'];
+        picture.alt = image.name || image['图号'] || '条款图片';
+        picture.loading = 'lazy';
+        const caption = document.createElement('figcaption');
+        caption.textContent = [image.name || image['图号'], image['PDF页码'] ? `PDF第${image['PDF页码']}页` : '']
+            .filter(Boolean).join(' · ');
+        figure.append(picture, caption);
+        details.appendChild(figure);
+    }
+    bubble.appendChild(details);
 }
 
 // ============ 清空多轮会话 ============
